@@ -153,6 +153,78 @@ describe('TokenPaymaster', function () {
     await ethers.provider.send('evm_revert', [snapshot])
   })
 
+  it('should be able to fully sponsor the UserOp', async () => {
+    const snapshot = await ethers.provider.send('evm_snapshot', [])
+
+    await paymaster.addToSponsored(account.address)
+
+    expect(await token.allowance(account.address, paymasterAddress)).to.be.equal(0)
+    expect(await ethers.provider.getBalance(beneficiaryAddress)).to.be.equal(0)
+
+    const prevBalancePaymaster = await ethers.provider.getBalance(paymasterAddress)
+    const prevStakedPaymaster = await entryPoint.balanceOf(paymasterAddress)
+
+    const paymasterAndData = generatePaymasterAndData(paymasterAddress)
+
+    const approvalTx = await token.populateTransaction.approve(
+      paymasterAddress, ethers.constants.MaxUint256
+    ).then(tx => tx.data!)
+    const executeApproval = await account.populateTransaction.execute(
+      token.address, 0, approvalTx
+    ).then(tx => tx.data!)
+
+    let op = await fillUserOp({
+        sender: account.address,
+        callData: executeApproval,
+        paymasterAndData,
+      }, entryPoint)
+
+    op = signUserOp(op, accountOwner, entryPoint.address, chainId)
+
+    const operations = [op]
+
+    // for simpler 'gasPrice()' calculation
+    await ethers.provider.send('hardhat_setNextBlockBaseFeePerGas', [utils.hexlify(op.maxFeePerGas)])
+
+    const tx = await entryPoint
+      .handleOps(operations, beneficiaryAddress, {
+        gasLimit: 3e7,
+        maxFeePerGas: op.maxFeePerGas,
+        maxPriorityFeePerGas: op.maxFeePerGas
+      }
+      )
+      .then(async tx => await tx.wait())
+
+    expect(await token.allowance(account.address, paymasterAddress)).to.be.equal(ethers.constants.MaxUint256)
+
+    const postBalanceBeneficiary = await ethers.provider.getBalance(beneficiaryAddress)
+
+    expect(postBalanceBeneficiary).to.be.gt(0)
+
+    expect(await entryPoint.balanceOf(paymasterAddress)).to.be.equal(
+      prevStakedPaymaster.sub(postBalanceBeneficiary)
+    )
+
+    const decodedLogs = tx.logs.map(it => {
+      return testInterface.parseLog(it)
+    })
+
+    // Any token should be transfered in a full sponsored transaction
+    decodedLogs.forEach(dl => {
+      assert.notEqual(dl.name, 'Transfers')
+    })
+
+    const fullySponsored = decodedLogs.find(dl => dl.name === 'UserOperationFullySponsored')
+    const opEvent = decodedLogs.find(dl => dl.name === 'UserOperationEvent')
+
+    // Same opHash
+    assert.equal(opEvent.args[0], fullySponsored.args[1])
+
+    expect(opEvent.args[5]).to.equal(postBalanceBeneficiary)
+
+    await ethers.provider.send('evm_revert', [snapshot])
+  })
+
   it('should be able to sponsor the UserOp while charging correct amount of ERC-20 tokens', async () => {
     const snapshot = await ethers.provider.send('evm_snapshot', [])
     await token.transfer(account.address, parseEther('1'))

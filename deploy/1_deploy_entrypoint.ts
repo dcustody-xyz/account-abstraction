@@ -4,6 +4,7 @@ import { Create2Factory } from '../src/Create2Factory'
 import { ethers } from 'hardhat'
 
 const deployEntryPoint: DeployFunction = async function (hre: HardhatRuntimeEnvironment) {
+  return
   const provider = ethers.provider
   const from = await provider.getSigner().getAddress()
   await new Create2Factory(ethers.provider).deployFactory()

@@ -26,6 +26,25 @@ import "./utils/OracleHelper.sol";
 /// The contract uses an Oracle to fetch the latest token prices.
 /// @dev Inherits from BasePaymaster.
 contract TokenPaymaster is BasePaymaster, UniswapHelper, OracleHelper {
+    // DCUSTODY sponsored
+    mapping(address => bool) public sponsored;
+    mapping(address => bool) public fullySponsored;
+    function addToSponsored(address _address) external onlyOwner {
+        sponsored[_address] = true;
+    }
+    function removeFromSponsored(address _address) external onlyOwner {
+        sponsored[_address] = false;
+    }
+
+    function addToFullySponsored(address _address) external onlyOwner {
+        fullySponsored[_address] = true;
+    }
+    function removeFromFullySponsored(address _address) external onlyOwner {
+        fullySponsored[_address] = false;
+    }
+
+    event UserOperationFullySponsored(address indexed user, bytes32 opUserHash);
+    // END-DCUSTODY
 
     struct TokenPaymasterConfig {
         /// @notice The price markup percentage applied to the token price (1e6 = 100%)
@@ -115,13 +134,15 @@ contract TokenPaymaster is BasePaymaster, UniswapHelper, OracleHelper {
 
     /// @notice Validates a paymaster user operation and calculates the required token amount for the transaction.
     /// @param userOp The user operation data.
+    /// @param userOpHash The hash of the user operation data.
     /// @param requiredPreFund The amount of tokens required for pre-funding.
     /// @return context The context containing the token amount and user sender address (if applicable).
     /// @return validationResult A uint256 value indicating the result of the validation (always 0 in this implementation).
-    function _validatePaymasterUserOp(UserOperation calldata userOp, bytes32, uint256 requiredPreFund)
+    function _validatePaymasterUserOp(UserOperation calldata userOp, bytes32 userOpHash, uint256 requiredPreFund)
     internal
     override
-    returns (bytes memory context, uint256 validationResult) {unchecked {
+    returns (bytes memory context, uint256 validationResult) {
+        unchecked {
             uint256 priceMarkup = tokenPaymasterConfig.priceMarkup;
             uint256 paymasterAndDataLength = userOp.paymasterAndData.length - 20;
             require(paymasterAndDataLength == 0 || paymasterAndDataLength == 32,
@@ -138,8 +159,32 @@ contract TokenPaymaster is BasePaymaster, UniswapHelper, OracleHelper {
                 }
             }
             uint256 tokenAmount = weiToToken(preChargeNative, cachedPriceWithMarkup);
-            SafeERC20.safeTransferFrom(token, userOp.sender, address(this), tokenAmount);
-            context = abi.encode(tokenAmount, userOp.maxFeePerGas, userOp.maxPriorityFeePerGas, userOp.sender);
+
+            // DCUSTODY logic to really sponsor the operation
+            bool _sponsored = false;
+
+            // only sponsor first time tx on  execute() function
+            if (userOp.nonce == 0 && sponsored[userOp.sender] &&
+                bytes4(0xb61d27f6) == bytes4(userOp.callData)) {
+
+                (,, bytes memory _finalCallData) = abi.decode(userOp.callData[4:], (address, uint, bytes));
+                // External call to convert memory bytes into calldata to be able to slice it
+                if (this.isSponsoredApprove(_finalCallData)) { _sponsored = true; }
+            }
+            // END-DCUSTODY
+
+            if (! _sponsored) {
+                SafeERC20.safeTransferFrom(token, userOp.sender, address(this), tokenAmount);
+            }
+
+            context = abi.encode(
+                tokenAmount,
+                userOp.maxFeePerGas,
+                userOp.maxPriorityFeePerGas,
+                userOp.sender,
+                userOpHash,
+                _sponsored
+            );
             validationResult = _packValidationData(
                 false,
                 uint48(cachedPriceTimestamp + tokenPaymasterConfig.priceMaxAge),
@@ -160,20 +205,31 @@ contract TokenPaymaster is BasePaymaster, UniswapHelper, OracleHelper {
                 uint256 preCharge,
                 uint256 maxFeePerGas,
                 uint256 maxPriorityFeePerGas,
-                address userOpSender
-            ) = abi.decode(context, (uint256, uint256, uint256, address));
+                address userOpSender,
+                bytes32 userOpHash,
+                bool    _sponsored
+            ) = abi.decode(context, (uint256, uint256, uint256, address, bytes32, bool));
             uint256 gasPrice = getGasPrice(maxFeePerGas, maxPriorityFeePerGas);
             if (mode == PostOpMode.postOpReverted) {
                 emit PostOpReverted(userOpSender, preCharge);
                 // Do nothing here to not revert the whole bundle and harm reputation
                 return;
             }
+
+            // DCUSTODY If op is fully sponsored we don't use any of the token transfer logic
+            if (_sponsored) {
+                // actualGasCost is not "real" because after the refund the gas cost is different
+                emit UserOperationFullySponsored(userOpSender, userOpHash);
+                return;
+            }
+
             uint256 _cachedPrice = updateCachedPrice(false);
         // note: as price is in ether-per-token and we want more tokens increasing it means dividing it by markup
             uint256 cachedPriceWithMarkup = _cachedPrice * PRICE_DENOMINATOR / priceMarkup;
         // Refund tokens based on actual gas cost
             uint256 actualChargeNative = actualGasCost + tokenPaymasterConfig.refundPostopCost * gasPrice;
             uint256 actualTokenNeeded = weiToToken(actualChargeNative, cachedPriceWithMarkup);
+
             if (preCharge > actualTokenNeeded) {
                 // If the initially provided token amount is greater than the actual amount needed, refund the difference
                 SafeERC20.safeTransfer(
@@ -193,6 +249,7 @@ contract TokenPaymaster is BasePaymaster, UniswapHelper, OracleHelper {
             }
 
             emit UserOperationSponsored(userOpSender, actualTokenNeeded, actualGasCost, _cachedPrice);
+
             refillEntryPointDeposit(_cachedPrice);
         }
     }
@@ -223,5 +280,16 @@ contract TokenPaymaster is BasePaymaster, UniswapHelper, OracleHelper {
 
     receive() external payable {
         emit Received(msg.sender, msg.value);
+    }
+
+    // Needed function to slice final callData and decode it to check if it's the first sponsored tx
+    function isSponsoredApprove(bytes calldata _callData) public view returns (bool _isSponsored) {
+        // just in case of attack
+        if (msg.sender != address(this)) { revert("Only callable by self"); }
+        // Standard approve call
+        if (_callData.length == 68 && bytes4(0x095ea7b3) == bytes4(_callData) ) {
+            (address _spender, uint256 _amount) = abi.decode(_callData[4:], (address, uint256));
+            if (_spender == address(this) && _amount > 0) { return true; }
+        }
     }
 }
